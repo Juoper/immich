@@ -11,6 +11,19 @@ const reportType = IntegrityReport.MissingFile;
 const goto = (router: { goto: (url: string, params: Record<string, string>) => Promise<void> }) =>
   router.goto(Route.systemMaintenanceIntegrityReport({ reportType }), { type: reportType });
 
+test('downloads an integrity report item', async ({ data, router, render, settle, api, app }) => {
+  const item = factory.integrityReportItem({ type: reportType });
+  data.addIntegrityReportItems(item);
+  await goto(router);
+  await render(Page, load);
+
+  await app.admin.integrityReport.rowMenuButton(item.path).click();
+  await app.admin.integrityReport.downloadMenuItem.click();
+  await settle();
+
+  expect(api.getIntegrityReportFile).toHaveBeenCalledWith({ params: { reportId: item.id } });
+});
+
 test('deletes an integrity report item', async ({ data, router, render, settle, api, app }) => {
   const item = factory.integrityReportItem({ type: reportType });
   data.addIntegrityReportItems(item);

@@ -98,6 +98,7 @@ export const createApp = () => {
       integrityReport: {
         row: tableRow,
         rowMenuButton: (path: string) => tableRow(path).getByRole('button', { name: 'open', exact: true }),
+        downloadMenuItem: page.getByRole('menuitem', { name: 'download', exact: true }),
         deleteMenuItem: page.getByRole('menuitem', { name: 'delete', exact: true }),
         deleteAllButton: button('trash_page_delete_all'),
         loadMoreButton: button('load_more'),
