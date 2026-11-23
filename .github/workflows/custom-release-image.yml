@@ -1,8 +1,10 @@
 name: Custom release image
 
 # Rebuilds the server image whenever Immich publishes a new release:
-# takes the release tag, replays the commits of FEATURE_BRANCH on top of it,
-# pushes the result to DEPLOY_BRANCH and publishes it to ghcr.io.
+# takes the release tag, replays the commits of FEATURE_BRANCH on top of it
+# and publishes the result to ghcr.io. With a DEPLOY_PUSH_TOKEN secret
+# (classic PAT with `repo` and `workflow` scopes) the rebased code is also
+# pushed to DEPLOY_BRANCH.
 
 on:
   schedule:
@@ -14,7 +16,7 @@ on:
         required: false
         default: ''
       force:
-        description: Rebuild even if this release was already built
+        description: Rebuild even if the image for this release already exists
         type: boolean
         default: false
 
@@ -38,28 +40,39 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: read
     outputs:
       release: ${{ steps.release.outputs.release }}
-      build: ${{ steps.release.outputs.build }}
       image: ${{ steps.release.outputs.image }}
+      build: ${{ steps.image.outputs.build }}
     steps:
       - id: release
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
-          FORCE: ${{ inputs.force }}
-          REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
         run: |
           release="${INPUT_TAG:-$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)}"
           echo "release=$release" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${OWNER,,}/immich-server" >> "$GITHUB_OUTPUT"
 
-          if [[ "$FORCE" != "true" ]] && git ls-remote --exit-code --tags "https://github.com/$REPO.git" "refs/tags/$release-$TAG_SUFFIX" > /dev/null; then
-            echo "$release was already built"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: image
+        env:
+          FORCE: ${{ inputs.force }}
+          IMAGE: ${{ steps.release.outputs.image }}
+          RELEASE: ${{ steps.release.outputs.release }}
+        run: |
+          if [[ "$FORCE" != "true" ]] && docker manifest inspect "$IMAGE:$RELEASE-$TAG_SUFFIX" > /dev/null 2>&1; then
+            echo "$IMAGE:$RELEASE-$TAG_SUFFIX already exists"
             echo "build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Building $release"
+            echo "Building $RELEASE"
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -69,14 +82,13 @@ jobs:
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    outputs:
-      sha: ${{ steps.push.outputs.sha }}
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.FEATURE_BRANCH }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Replay feature commits on the release
         env:
@@ -136,26 +148,55 @@ jobs:
             git commit -m 'chore: regenerate open-api'
           fi
 
-      - id: push
-        name: Push deploy branch
+      - name: Bundle rebased commits
+        env:
+          RELEASE: ${{ needs.check.outputs.release }}
+        run: git bundle create "$RUNNER_TEMP/deploy.bundle" "refs/tags/$RELEASE..refs/heads/$DEPLOY_BRANCH"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deploy-bundle
+          path: ${{ runner.temp }}/deploy.bundle
+          retention-days: 7
+
+      - name: Push deploy branch
+        env:
+          PUSH_TOKEN: ${{ secrets.DEPLOY_PUSH_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          git push --force origin "HEAD:refs/heads/$DEPLOY_BRANCH"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ -z "$PUSH_TOKEN" ]]; then
+            echo "::notice::DEPLOY_PUSH_TOKEN is not set, skipping the push of $DEPLOY_BRANCH"
+            exit 0
+          fi
+          git push --force "https://x-access-token:$PUSH_TOKEN@github.com/$REPO.git" "HEAD:refs/heads/$DEPLOY_BRANCH"
 
   build:
     name: Build and push image
     needs: [check, rebase]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          ref: ${{ needs.rebase.outputs.sha }}
+          name: deploy-bundle
+          path: ${{ runner.temp }}
+
+      - id: source
+        name: Restore rebased source
+        env:
+          RELEASE: ${{ needs.check.outputs.release }}
+        run: |
+          git init --quiet .
+          git fetch --depth 1 "https://github.com/$UPSTREAM.git" "refs/tags/$RELEASE:refs/tags/$RELEASE"
+          git fetch "$RUNNER_TEMP/deploy.bundle" "refs/heads/$DEPLOY_BRANCH"
+          git checkout --quiet FETCH_HEAD
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git log --oneline -5
 
       - uses: docker/setup-qemu-action@v3
         if: contains(env.PLATFORMS, 'arm64')
@@ -179,16 +220,9 @@ jobs:
             BUILD_ID=${{ github.run_id }}
             BUILD_IMAGE=${{ needs.check.outputs.release }}-${{ env.TAG_SUFFIX }}
             BUILD_SOURCE_REF=${{ env.DEPLOY_BRANCH }}
-            BUILD_SOURCE_COMMIT=${{ needs.rebase.outputs.sha }}
+            BUILD_SOURCE_COMMIT=${{ steps.source.outputs.sha }}
           tags: |
             ${{ needs.check.outputs.image }}:${{ needs.check.outputs.release }}-${{ env.TAG_SUFFIX }}
             ${{ needs.check.outputs.image }}:release-${{ env.TAG_SUFFIX }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Mark release as built
-        env:
-          RELEASE: ${{ needs.check.outputs.release }}
-        run: |
-          git tag --force "$RELEASE-$TAG_SUFFIX"
-          git push --force origin "refs/tags/$RELEASE-$TAG_SUFFIX"
